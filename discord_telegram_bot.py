@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import binascii
+import aiohttp
 
 import discord
 from discord.ext import commands
