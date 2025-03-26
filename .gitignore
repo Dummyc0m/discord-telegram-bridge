@@ -1,1 +1,4 @@
 secrets
+dist
+result
+**/__pycache__
