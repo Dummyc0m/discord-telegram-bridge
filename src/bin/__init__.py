@@ -290,11 +290,12 @@ async def telegram_forward_message(update: Update, context: ContextTypes.DEFAULT
     current_pos = 0
 
     # Sort entities by offset to process in order
-    entities.sort(key=lambda e: e.offset)
+    sorted_entities = sorted(entities, key=lambda e: e.offset)
 
-    logger.debug(f"TG_FWD: Processing {len(entities)} entities for message {message.message_id}")
+    logger.debug(f"TG_FWD: Processing {len(sorted_entities)} entities for message {message.message_id}")
 
-    for entity in entities:
+    # Iterate over the newly created sorted list
+    for entity in sorted_entities:
         # 1. Append and escape text *before* the current entity
         part_before = text_content[current_pos:entity.offset]
         processed_parts.append(escape_discord_markdown(part_before))
