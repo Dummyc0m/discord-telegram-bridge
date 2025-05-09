@@ -6,6 +6,7 @@ import re
 import io
 import json
 import html
+import uuid
 from collections import OrderedDict
 
 import discord
@@ -107,6 +108,95 @@ def add_message_mapping(dc_msg_id, tg_msg_id, is_media_tg=False, is_media_dc=Fal
 
 # --- Helper Functions ---
 
+# URL detection regex pattern
+# This pattern matches common URL formats including http, https, ftp protocols
+# as well as www. prefixed URLs
+URL_PATTERN = re.compile(
+    r'(https?://|www\.)[^\s<>\[\]{}|\\^~`"\'\s]+[^\s<>\[\]{}|\\^~`"\',.:;?!]',
+    re.IGNORECASE
+)
+
+def detect_urls(text: str) -> list[tuple[int, int, str]]:
+    """
+    Detects URLs in text and returns a list of tuples with (start_index, end_index, url).
+    """
+    if not text:
+        return []
+    
+    return [(match.start(), match.end(), match.group(0)) for match in URL_PATTERN.finditer(text)]
+
+def protect_urls_for_telegram(text: str) -> tuple[str, dict]:
+    """
+    Replaces URLs in text with placeholders for safe HTML conversion.
+    Returns the modified text and a dictionary mapping placeholders to original URLs.
+    """
+    if not text:
+        return text, {}
+    
+    url_map = {}
+    
+    def replacer(match):
+        url = match.group(0)
+        # Use a placeholder that is unlikely to be markdown-interpreted or conflict with HTML
+        placeholder = f"%%URLPLACEHOLDER{str(uuid.uuid4()).replace('-', '')}%%"
+        url_map[placeholder] = url
+        return placeholder
+
+    # Replace all found URLs with placeholders using URL_PATTERN
+    modified_text = URL_PATTERN.sub(replacer, text)
+    return modified_text, url_map
+
+def restore_urls_for_telegram(text: str, url_map: dict) -> str:
+    """
+    Restores URLs from placeholders, wrapping them in HTML anchor tags.
+    """
+    if not text or not url_map:
+        return text
+    
+    result = text
+    for placeholder, url in url_map.items():
+        # Create a proper HTML link
+        # If URL doesn't start with a protocol, add https://
+        href_url = url if url.startswith(('http://', 'https://', 'ftp://')) else f"https://{url}"
+        html_link = f'<a href="{escape_html(href_url)}">{escape_html(url)}</a>'
+        result = result.replace(placeholder, html_link)
+    
+    return result
+
+def escape_discord_markdown_preserve_urls(text: str) -> str:
+    """
+    Escapes Discord markdown characters while preserving URLs.
+    """
+    if not text:
+        return ""
+    
+    # Find all URLs in the text
+    urls = detect_urls(text)
+    
+    # If no URLs, use the regular escape function
+    if not urls:
+        return escape_discord_markdown(text)
+    
+    # Replace URLs with placeholders
+    url_map = {}
+    
+    def replacer(match):
+        url = match.group(0)
+        placeholder = f"%%URLPLACEHOLDER{str(uuid.uuid4()).replace('-', '')}%%"
+        url_map[placeholder] = url
+        return placeholder
+
+    modified_text = URL_PATTERN.sub(replacer, text)
+    
+    # Escape markdown in the modified text
+    escaped_text = escape_discord_markdown(modified_text)
+    
+    # Restore URLs
+    for placeholder, url in url_map.items():
+        escaped_text = escaped_text.replace(placeholder, url)
+    
+    return escaped_text
+
 async def download_file(url: str) -> bytes | None:
     """Downloads a file from a URL."""
     try:
@@ -137,82 +227,71 @@ def escape_discord_markdown(text: str | None) -> str:
 
 
 def format_discord_message_for_telegram(message: discord.Message) -> str:
-    """Formats a Discord message content for Telegram HTML, handling markdown and mentions."""
-    # Start with clean_content to resolve Discord mentions to names
-    # But clean_content removes formatting, so we need to reapply based on raw content
-    # Let's process the raw content first, then substitute mentions.
-    content = message.content # Use raw content for formatting
+    """Formats a Discord message content for Telegram HTML, handling markdown, mentions, and URLs."""
+    raw_content = message.content
 
-    # --- Basic Markdown to HTML ---
-    # Order matters: Code blocks first, then others
-    content = re.sub(r'```(\w+)?\n(.*?)```', r'<pre><code class="language-\1">\2</code></pre>', content, flags=re.DOTALL | re.IGNORECASE)
-    content = re.sub(r'```(.*?)```', r'<pre>\1</pre>', content, flags=re.DOTALL) # Code block (no language)
-    content = re.sub(r'`(.*?)`', r'<code>\1</code>', content)            # Inline code
-    content = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', content)       # Bold
-    content = re.sub(r'__(.*?)__', r'<u>\1</u>', content)           # Underline
-    # Italic: Handle both *italic* and _italic_ but avoid conflicts with bold/underline
-    # Need lookarounds or careful ordering. Simpler: prioritize * then _.
-    content = re.sub(r'(?<!\*)\*(?!\*)(.*?)(?<!\*)\*(?!\*)', r'<i>\1</i>', content) # *italic*
-    content = re.sub(r'(?<!_)_(?!_)(.*?)(?<!_)_(?!_)', r'<i>\1</i>', content) # _italic_
-    content = re.sub(r'~~(.*?)~~', r'<s>\1</s>', content)       # Strikethrough
-    content = re.sub(r'\|\|(.*?)\|\|', r'<span class="tg-spoiler">\1</span>', content) # Spoiler -> Telegram Spoiler
-
-    # --- Handle Mentions ---
-    # Replace Discord mention IDs with linked names if possible, or escaped names otherwise.
-    processed_content = content # Work on a copy for mention replacement
+    # 1. Protect URLs using %%URLPLACEHOLDER...%% style
+    content_with_placeholders, url_map = protect_urls_for_telegram(raw_content)
+    
+    # 2. Handle Mentions (on content with URL placeholders)
+    #    This converts Discord's <@id>, <@&id>, <#id> into HTML links or @display_name.
+    #    The %%...%% placeholders will not be affected by these regexes.
+    content_after_mentions = content_with_placeholders
 
     # User Mentions (<@!id> or <@id>)
-    mention_pattern = re.compile(r'<@!?(\d+)>')
-    for match in mention_pattern.finditer(content):
-        user_id_str = match.group(1)
+    def user_mention_repl(match_obj):
+        user_id_str = match_obj.group(1)
         user_id = int(user_id_str)
-        # Find the corresponding member object in the message's mentions list
         mentioned_user = next((u for u in message.mentions if u.id == user_id), None)
         display_name = mentioned_user.display_name if mentioned_user else f"Unknown User ({user_id})"
-
-        # Check user map for Telegram link
-        tg_user_id = user_map.get(f"discord:{user_id_str}") # Use string key
+        tg_user_id = user_map.get(f"discord:{user_id_str}")
         if tg_user_id:
-            mention_html = f'<a href="tg://user?id={tg_user_id}">{escape_html(display_name)}</a>'
+            return f'<a href="tg://user?id={tg_user_id}">{escape_html(display_name)}</a>'
         else:
-            # Keep the @ but escape the name
-            mention_html = f"@{escape_html(display_name)}"
+            return f"@{escape_html(display_name)}"
+    content_after_mentions = re.sub(r'<@!?(\d+)>', user_mention_repl, content_after_mentions)
 
-        # Replace the specific <@...> tag found
-        processed_content = processed_content.replace(match.group(0), mention_html)
+    # Role Mentions (<@&id>)
+    def role_mention_repl(match_obj):
+        role_id = int(match_obj.group(1))
+        role = message.guild.get_role(role_id) if message.guild else None
+        role_name = role.name if role else f"Unknown Role ({role_id})"
+        return f"@{escape_html(role_name)}"
+    content_after_mentions = re.sub(r'<@&(\d+)>', role_mention_repl, content_after_mentions)
 
+    # Channel Mentions (<#id>)
+    def channel_mention_repl(match_obj):
+        channel_id = int(match_obj.group(1))
+        channel = message.guild.get_channel(channel_id) if message.guild else None
+        channel_name = channel.name if channel else f"Unknown Channel ({channel_id})"
+        return f"#{escape_html(channel_name)}"
+    content_after_mentions = re.sub(r'<#(\d+)>', channel_mention_repl, content_after_mentions)
+    
+    # Handle @everyone/@here (literal strings)
+    # message.mention_everyone is a boolean, but we need to replace the string if present.
+    if "@everyone" in content_after_mentions:
+        content_after_mentions = content_after_mentions.replace('@everyone', '@\u200Beveryone')
+    if "@here" in content_after_mentions:
+        content_after_mentions = content_after_mentions.replace('@here', '@\u200Bhere')
 
-    # Role Mentions (<@&id>) - Just show role name
-    role_pattern = re.compile(r'<@&(\d+)>')
-    for match in role_pattern.finditer(content):
-         role_id = int(match.group(1))
-         role = message.guild.get_role(role_id) if message.guild else None
-         role_name = role.name if role else f"Unknown Role ({role_id})"
-         processed_content = processed_content.replace(match.group(0), f"@{escape_html(role_name)}")
+    # 3. Basic Markdown to HTML (on content with resolved mentions [now HTML] and %%...%% URL placeholders)
+    #    The %%...%% placeholders are designed not to be affected by these markdown rules.
+    #    For example, _%%P%%_ would become <i>%%P%%</i>, which is fine for restoration.
+    html_content = content_after_mentions
+    html_content = re.sub(r'```(\w+)?\n(.*?)```', r'<pre><code class="language-\1">\2</code></pre>', html_content, flags=re.DOTALL | re.IGNORECASE)
+    html_content = re.sub(r'```(.*?)```', r'<pre>\1</pre>', html_content, flags=re.DOTALL)
+    html_content = re.sub(r'`(.*?)`', r'<code>\1</code>', html_content)
+    html_content = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', html_content)
+    html_content = re.sub(r'__(.*?)__', r'<u>\1</u>', html_content) # Underline
+    html_content = re.sub(r'(?<!\*)\*(?!\*)(.*?)(?<!\*)\*(?!\*)', r'<i>\1</i>', html_content) # *italic*
+    html_content = re.sub(r'(?<!_)_(?!_)(.*?)(?<!_)_(?!_)', r'<i>\1</i>', html_content) # _italic_
+    html_content = re.sub(r'~~(.*?)~~', r'<s>\1</s>', html_content) # Strikethrough
+    html_content = re.sub(r'\|\|(.*?)\|\|', r'<span class="tg-spoiler">\1</span>', html_content) # Spoiler
 
-    # Channel Mentions (<#id>) - Just show channel name
-    channel_pattern = re.compile(r'<#(\d+)>')
-    for match in channel_pattern.finditer(content):
-         channel_id = int(match.group(1))
-         channel = message.guild.get_channel(channel_id) if message.guild else None
-         channel_name = channel.name if channel else f"Unknown Channel ({channel_id})"
-         processed_content = processed_content.replace(match.group(0), f"#{escape_html(channel_name)}")
-
-
-    # --- Handle @everyone/@here ---
-    if message.mention_everyone:
-        # Use zero-width space to prevent actual pings sometimes
-        processed_content = processed_content.replace('@everyone', '@\u200Beveryone')
-        processed_content = processed_content.replace('@here', '@\u200Bhere')
-
-
-    # Final cleanup - escape any remaining bare <, >, &
-    # This is tricky. Ideally escape *before* adding tags. But regex makes it hard.
-    # Let's selectively escape only these outside our generated tags.
-    # This is imperfect. A proper HTML parser/builder would be better.
-    # For simplicity, we accept limitations here. Ensure user input doesn't break tags.
-
-    return processed_content # Return the content with HTML and resolved mentions
+    # 4. Restore URLs from %%...%% placeholders
+    final_content = restore_urls_for_telegram(html_content, url_map)
+    
+    return final_content
 
 async def get_telegram_sender_name(tg_user: TGUser) -> str:
     """Gets a display name for a Telegram user, HTML escaped."""
@@ -298,7 +377,8 @@ async def telegram_forward_message(update: Update, context: ContextTypes.DEFAULT
     for entity in sorted_entities:
         # 1. Append and escape text *before* the current entity
         part_before = text_content[current_pos:entity.offset]
-        processed_parts.append(escape_discord_markdown(part_before))
+        # Use the new escape function that preserves URLs
+        processed_parts.append(escape_discord_markdown_preserve_urls(part_before))
 
         # 2. Process the entity itself
         entity_text = text_content[entity.offset : entity.offset + entity.length]
@@ -323,14 +403,23 @@ async def telegram_forward_message(update: Update, context: ContextTypes.DEFAULT
             logger.info(f"TG_FWD: Translated mention '{entity_text}' to Discord ping '{ping_text}'")
         else:
             # If not found or not a mention type we handle, append escaped original
-            processed_parts.append(escape_discord_markdown(entity_text))
+            # Use the new escape function that preserves URLs
+            if entity.type == entity.type.URL or entity.type == entity.type.TEXT_LINK:
+                # For URLs and text links, we don't want to escape them further for Discord
+                # as Discord handles them well. If it's a text_link, entity_text is the URL.
+                # For text_link, the display text is handled by Telegram; we just pass the URL.
+                processed_parts.append(entity_text)
+            else:
+                processed_parts.append(escape_discord_markdown_preserve_urls(entity_text))
+
 
         # 4. Update position
         current_pos = entity.offset + entity.length
 
     # 5. Append and escape any remaining text after the last entity
     part_after = text_content[current_pos:]
-    processed_parts.append(escape_discord_markdown(part_after))
+    # Use the new escape function that preserves URLs
+    processed_parts.append(escape_discord_markdown_preserve_urls(part_after))
 
     # 6. Join the parts
     final_discord_content = "".join(processed_parts)
@@ -470,7 +559,8 @@ async def telegram_edit_message(update: Update, context: ContextTypes.DEFAULT_TY
 
         sender_name = await get_telegram_sender_name(edited_message.from_user) # Escaped
         new_text_content = edited_message.text or edited_message.caption or ""
-        safe_new_text_content = escape_discord_markdown(new_text_content)
+        # Use the new escape function that preserves URLs
+        safe_new_text_content = escape_discord_markdown_preserve_urls(new_text_content)
         new_discord_content = f"**{sender_name}:** {safe_new_text_content}"
 
         # Check if original had media - Discord edits replace everything.
@@ -578,7 +668,7 @@ async def discord_forward_message(message: discord.Message, tg_bot: 'telegram.Bo
                  text=final_text_content[:MAX_MESSAGE_LENGTH_TG],
                  parse_mode=constants.ParseMode.HTML,
                  reply_to_message_id=reply_to_tg_msg_id,
-                 disable_web_page_preview=True
+                 disable_web_page_preview=False # Enable link previews
              )
 
         # Send custom emojis as separate photos *after* the main message
@@ -654,7 +744,7 @@ async def discord_edit_message(before: discord.Message, after: discord.Message, 
                 message_id=tg_msg_id,
                 text=final_new_text[:MAX_MESSAGE_LENGTH_TG],
                 parse_mode=constants.ParseMode.HTML,
-                disable_web_page_preview=True
+                disable_web_page_preview=False # Enable link previews
             )
 
         # Update the stored original content in the map
